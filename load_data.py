@@ -8,14 +8,14 @@ Created on Fri Jun  6 13:54:22 2025
 import torch
 import cv2
 import numpy as np
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import torchvision.transforms as T
 # import torchvision.io as io  # For video reading
 
 
 
-VID_PATH = './data/left/'
+VIDEO_PATH = './data/left/'
 CSV_PATH = './data/PegTransfer.csv'
 FRAMES_PER_CLIP = 50
 
@@ -28,46 +28,46 @@ label = label1 or label2
 
 
 # Normalized 0-255 pixels to [0,1], resize, and convert to RGB 
-def preprocess_video_frame(frame, to_normalize = True, resize = (112,112), to_RGB = True):
-    if resize is not None:
-        frame = cv2.resize(frame, resize)  # Resize frame
-        frame.reshape(3, resize[0], resize[1])
-    if to_RGB:
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # Convert to RGB
-    if to_normalize:
-        frame = frame / 255.0  # Normalize to [0, 1]
+# def preprocess_video_frame(frame, to_normalize = True, resize = (112,112), to_RGB = True):
+#     if resize is not None:
+#         frame = cv2.resize(frame, resize)  # Resize frame
+#         frame.reshape(3, resize[0], resize[1])
+#     if to_RGB:
+#         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # Convert to RGB
+#     if to_normalize:
+#         frame = frame / 255.0  # Normalize to [0, 1]
         
-    return frame
+#     return frame
 
 # Read the video and turn it into a numpy array with given length consisting frames that 
 # are preprocessed (renormalized as above)
-def load_video(video_path, frames_per_clip=50):
-    cap = cv2.VideoCapture(video_path)
+# def load_video(video_path, frames_per_clip=50):
+#     cap = cv2.VideoCapture(video_path)
     
-    if not cap.isOpened():
-        print("Error: Could not open video.")
-        return None
+#     if not cap.isOpened():
+#         print("Error: Could not open video.")
+#         return None
     
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    frame_indices = [i* (total_frames//frames_per_clip) for i in range(frames_per_clip)]
-    #frame_indices = list(range(0, total_frames, total_frames // (frames_per_clip) )) 
-    frames = []
+#     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+#     frame_indices = [i* (total_frames//frames_per_clip) for i in range(frames_per_clip)]
+#     #frame_indices = list(range(0, total_frames, total_frames // (frames_per_clip) )) 
+#     frames = []
     
-    for idx in frame_indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ret, frame = cap.read()
+#     for idx in frame_indices:
+#         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+#         ret, frame = cap.read()
         
-        if ret:
-            frame = preprocess_video_frame(frame)
-            frames.append(frame)
-        else:
-            break
+#         if ret:
+#             frame = preprocess_video_frame(frame)
+#             frames.append(frame)
+#         else:
+#             break
     
-    cap.release()
+#     cap.release()
     
-    # Convert list to numpy array of shape (frames, height, width, channels)
-    frames = np.array(frames)
-    return frames
+#     # Convert list to numpy array of shape (frames, height, width, channels)
+#     frames = np.array(frames)
+#     return frames
 
 
 # if not cap.isOpened():
@@ -107,50 +107,111 @@ def show_frames(frames, waitKey=100):
     cv2.destroyAllWindows()
     return 
 
-frames = load_video(VID_PATH +'blaox.mkv')
-print(show_frames(frames))
+# frames = load_video(VID_PATH +'blaox.mkv')
+# print(show_frames(frames))
+# print(frames.shape)
 
-print(frames.shape)
+
+
 class VideoDataset(Dataset):
-    def __init__(self, csv_path, video_folder, transform=None, frames_per_clip=16):
-        self.annotations = pd.read_csv(csv_path)
+    def __init__(self, video_folder, annotations_file, resize_shape=(112, 112), frames_per_clip=50):
         self.video_folder = video_folder
-        self.transform = transform
+        self.annotations = pd.read_csv(annotations_file)
+        self.resize_shape = resize_shape
         self.frames_per_clip = frames_per_clip
-
+        
     def __len__(self):
+        # Number of samples in the dataset (number of video files)
         return len(self.annotations)
 
     def __getitem__(self, idx):
-        video_name = self.annotations.iloc[idx]['id']  # assuming first col is filename
+        # Get the video filename and its label
+        video_filename = self.annotations.iloc[idx, 0]
         label1 = self.annotations.iloc[idx]['object_dropped_within_fov']
         label2 = self.annotations.iloc[idx]['object_dropped_outside_of_fov']
         label = label1 or label2
         
-        video_path = f"{self.video_folder}/{video_name}.mkv"
+        # Load the video frames
+        frames = self.load_video_frames(video_filename)
         
-        # Load video: video shape (T, H, W, C)
-        video, _, _ = io.read_video(video_path, pts_unit='sec')
-
-        # Sample or pad frames to fixed length
-        video = self._sample_frames(video)
-
-        # video shape -> (T, H, W, C), convert to (C, T, H, W)
-        video = video.permute(3, 0, 1, 2).float() / 255.0
-
+        # Apply transformation (e.g., normalization)
         if self.transform:
-            video = self.transform(video)
+            frames = self.transform(frames)
+        
+        # Convert frames to tensor and return as (frames, channels, height, width) format
+        frames = torch.tensor(frames, dtype=torch.float32)
+        label = torch.tensor(label, dtype=torch.long)
+        
+        return frames, label
+    
+    def preprocess_video_frame(frame, to_normalize = True, resize = (112,112), to_RGB = True):
+        if resize is not None:
+            frame = cv2.resize(frame, resize)  # Resize frame
+            frame.reshape(3, resize[0], resize[1])
+        if to_RGB:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # Convert to RGB
+        if to_normalize:
+            frame = frame / 255.0  # Normalize to [0, 1]
+            
+        return frame
 
-        return video, label
+    
+    def load_video_frames(self, video_id):
+        # Construct the full path to the video
+        #video_path = os.path.join(self.video_folder, video_id)
+        video_path = self.video_folder + video_id + '.mkv'
+        cap = cv2.VideoCapture(video_path)
+        frames = []
+        
+        if not cap.isOpened():
+            print("Error: Could not open video.")
+            return None
+        
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        frame_indices = [i* (total_frames//self.frames_per_clip) for i in range(self.frames_per_clip)]
+        #frame_indices = list(range(0, total_frames, total_frames // (frames_per_clip) )) 
+        frames = []
+        
+        for idx in frame_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            
+            if ret:
+                frame = self.preprocess_video_frame(frame)
+                frames.append(frame)
+            else:
+                break
+        
+        cap.release()
+        
+        # Convert list to numpy array of shape (frames, height, width, channels)
+        frames = np.array(frames)
+        return frames
+    
+    def show_frames(frames, waitKey=100):
+    # Display the frames as a video
+        for frame in frames:
+            # Show the frame
+            cv2.imshow('Video', frame)
+            # Wait for 30 milliseconds and check if the 'q' key is pressed to exit
+            if cv2.waitKey(waitKey) & 0xFF == ord('q'):
+                break
+        # Close the OpenCV window
+        cv2.destroyAllWindows()
+        return 
 
-    def _sample_frames(self, video):
-        total_frames = video.shape[0]
-        if total_frames >= self.frames_per_clip:
-            indices = torch.linspace(0, total_frames-1, self.frames_per_clip).long()
-            sampled = video[indices]
-        else:
-            # pad with last frame if less frames than required
-            pad_len = self.frames_per_clip - total_frames
-            pad_frames = video[-1].unsqueeze(0).repeat(pad_len, 1, 1, 1)
-            sampled = torch.cat([video, pad_frames], dim=0)
-        return sampled
+
+# Example usage:
+video_folder = VIDEO_PATH  # Folder containing video files
+annotations_file = CSV_PATH  # Path to the CSV file with annotations
+
+# Create the dataset
+dataset = VideoDataset(video_folder, annotations_file,)
+
+# Create a DataLoader for batching the data during training
+dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
+
+# Iterate over the dataloader and print the shape of video data and labels
+for frames, labels in dataloader:
+    print(f"Frames shape: {frames.shape}")
+    print(f"Labels: {labels}")
