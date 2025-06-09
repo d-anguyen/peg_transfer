@@ -30,7 +30,7 @@ class SNNVideoClassifier(nn.Module):
     
 
 class ShallowSNNVideoNet(nn.Module):
-    # try (input_h, input_w) as multiple of (56,96) (original frame size = 560x960)
+    # try (input_h, input_w) as multiple of (54,96) (original frame size = 540x960)
     def __init__(self, num_classes=2, input_h=112, input_w=112):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels=3, out_channels=16, kernel_size=3, padding=1)

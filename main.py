@@ -17,7 +17,7 @@ VIDEO_PATH = '/home/groups/ai/ducanh/PegTransferData/left/'
 CSV_PATH = '/home/groups/ai/ducanh/PegTransferData/PegTransfer.csv'
 FRAMES_PER_CLIP = 50
 FRAME_SIZE = (54,96)
-batch_size = 20
+batch_size = 8
 lr = 1e-3
 weight_decay = 1e-4
 num_epochs = 1
@@ -33,5 +33,5 @@ val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
 # Create a SNN model and train
-SNN = ShallowSNNVideoNet().to(device)
+SNN = ShallowSNNVideoNet(num_classes=2, input_h=FRAME_SIZE[0], input_w=FRAME_SIZE[1]).to(device)
 train(SNN, train_loader, val_loader, num_epochs=num_epochs)

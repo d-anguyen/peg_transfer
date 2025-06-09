@@ -140,6 +140,4 @@ def show_frames(frames, waitKey=100):
     cv2.destroyAllWindows()
     return 
 
-frames = load_frames(VIDEO_PATH, 'blaox', frames_per_clip = 100, to_process=False)
-print(frames.shape)
-show_frames(frames, waitKey = 100)
+    
