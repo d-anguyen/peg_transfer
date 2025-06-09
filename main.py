@@ -1,5 +1,7 @@
 from load_data import *
 from models import *
+from train import *
+
 import torch
 import torch.nn as nn
 import snntorch as snn
