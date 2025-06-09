@@ -8,7 +8,7 @@ lr = 1e-3
 weight_decay = 1e-4
 
 
-def train(model, train_loader, num_epochs):
+def train(model, train_loader, val_loader, num_epochs):
     
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     criterion = nn.CrossEntropyLoss()
@@ -28,19 +28,21 @@ def train(model, train_loader, num_epochs):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-
+            
         print(f"Epoch {epoch+1}: Loss = {loss.item():.4f}")
-        
-def evaluate_model(model, test_loader):
+        print(f'Train accuracy: {evaluate_model(model, train_loader):.2f}%')
+        print(f'Validation accuracy: {evaluate_model(model, val_loader):.2f}%')
+        print('--------------------------------------------')
+def evaluate_model(model, dataloader):
     model.eval()
     correct = 0
     total = 0
     with torch.no_grad():
-        for images, labels in test_loader:
+        for images, labels in dataloader:
             outputs = model(images)
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
     accuracy = 100 * correct / total
-    print(f"Test Accuracy: {accuracy:.2f}%")
+    #print(f"Test Accuracy: {accuracy:.2f}%")
     return accuracy

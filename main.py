@@ -11,8 +11,8 @@ import time
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-VIDEO_PATH = './home/groups/ai/ducanh/PegTransferData/left/'
-CSV_PATH = './home/groups/ai/ducanh/PegTransferData/PegTransfer.csv'
+VIDEO_PATH = '/home/groups/ai/ducanh/PegTransferData/left/'
+CSV_PATH = '/home/groups/ai/ducanh/PegTransferData/PegTransfer.csv'
 FRAMES_PER_CLIP = 50
 FRAME_SIZE = (112,112)
 batch_size = 20
