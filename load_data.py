@@ -18,19 +18,6 @@ FRAMES_PER_CLIP = 50
 FRAME_SIZE = (112,112)
 
 
-def show_frames(frames, waitKey=100):
-# Display the frames as a video
-    for frame in frames:
-        # Show the frame
-        cv2.imshow('Video', frame)
-        # Wait for 30 milliseconds and check if the 'q' key is pressed to exit
-        if cv2.waitKey(100) & 0xFF == ord('q'):
-            break
-    # Close the OpenCV window
-    cv2.destroyAllWindows()
-    return 
-
-
 class VideoDataset(Dataset):
     def __init__(self, video_folder, csv_path, data_split, resize_shape=(112, 112), frames_per_clip=50):
         self.video_folder = video_folder

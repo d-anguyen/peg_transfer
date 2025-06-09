@@ -11,8 +11,8 @@ import time
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-VIDEO_PATH = './data/left/'
-CSV_PATH = './data/PegTransfer.csv'
+VIDEO_PATH = './home/groups/ai/ducanh/PegTransferData/left/'
+CSV_PATH = './home/groups/ai/ducanh/PegTransferData/PegTransfer.csv'
 FRAMES_PER_CLIP = 50
 FRAME_SIZE = (112,112)
 batch_size = 20
@@ -30,48 +30,14 @@ val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
 # Create
-SNN = SNNVideoClassifier().to(device)
+SNN = ShallowSNNVideoNet().to(device)
 
 # frames, labels = next(iter(train_loader))
 # frames = frames.to(device)
 # labels = labels.to(device)
 
 
-def train(model, train_loader, num_epochs):
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    criterion = nn.CrossEntropyLoss()
 
-    for epoch in range(num_epochs):
-        SNN.train()
-        for i, (inputs, labels) in enumerate(train_loader):
-            
-            inputs = inputs.float().to(device)    # [B, T, C, H, W]
-            labels = labels.to(device)
-                        
-            outputs = SNN(inputs)
-            loss = criterion(outputs, labels)
-            
-            if i%10 ==0:
-                print(f"Loss={loss.item():.4f}")
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-        print(f"Epoch {epoch+1}: Loss = {loss.item():.4f}")
-        
-def evaluate_model(model, test_loader):
-    model.eval()
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for images, labels in test_loader:
-            outputs = model(images)
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-    accuracy = 100 * correct / total
-    print(f"Test Accuracy: {accuracy:.2f}%")
-    return accuracy
 
 
 train(SNN, train_loader, num_epochs=1)
