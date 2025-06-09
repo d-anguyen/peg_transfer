@@ -15,7 +15,7 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 VIDEO_PATH = './data/left/'
 CSV_PATH = './data/PegTransfer.csv'
 FRAMES_PER_CLIP = 50
-FRAME_SIZE = (112,112)
+FRAME_SIZE = (54,96)
 
 
 class VideoDataset(Dataset):
@@ -83,17 +83,63 @@ class VideoDataset(Dataset):
         # Convert list to numpy array of shape (frames, height, width, channels)
         frames = np.array(frames, dtype=np.float32)
         return frames
+
+def load_frames(video_folder, video_id, frames_per_clip, to_process=False):
+    # Construct the full path to the video
+    #video_path = os.path.join(self.video_folder, video_id)
+    video_path = video_folder + video_id + '.mkv'
+    cap = cv2.VideoCapture(video_path)
+    frames = []
     
-    def show_frames(frames, waitKey=100):
-    # Display the frames as a video
-        for frame in frames:
-            # Show the frame
-            cv2.imshow('Video', frame)
-            # Wait for 30 milliseconds and check if the 'q' key is pressed to exit
-            if cv2.waitKey(waitKey) & 0xFF == ord('q'):
-                break
-        # Close the OpenCV window
-        cv2.destroyAllWindows()
-        return 
+    if not cap.isOpened():
+        print("Error: Could not open video.")
+        return None
+    
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_indices = [i* (total_frames//frames_per_clip) for i in range(frames_per_clip)]
+    #frame_indices = list(range(0, total_frames, total_frames // (frames_per_clip) )) 
+    frames = []
+    
+    for idx in frame_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        
+        
+        if ret:
+            if to_process==True:
+                frame = preprocess_frame(frame)
+            frames.append(frame)
+        else:
+            print('Frame not found!')
+            break
+    
+    cap.release()
+    
+    # Convert list to numpy array of shape (frames, height, width, channels)
+    frames = np.array(frames, dtype=np.float32)
+    return frames
 
+def preprocess_frame(resize_shape, frame, to_normalize = True, to_RGB = True):
+    frame = cv2.resize(frame, resize_shape)  # Resize frame
+    if to_RGB:
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # Convert to RGB
+    frame = np.transpose(frame, (2, 0, 1)) # Convert HxWxC to CxHxW
+    if to_normalize:
+        frame = frame / 255.0  # Normalize to [0, 1]    
+    return frame
+    
+def show_frames(frames, waitKey=100):
+# Display the frames as a video (HxWxC)
+    for frame in frames:
+        # Show the frame
+        cv2.imshow('Video', frame)
+        # Wait for 30 milliseconds and check if the 'q' key is pressed to exit
+        if cv2.waitKey(waitKey) & 0xFF == ord('q'):
+            break
+    # Close the OpenCV window
+    cv2.destroyAllWindows()
+    return 
 
+frames = load_frames(VIDEO_PATH, 'blaox', frames_per_clip = 100, to_process=False)
+print(frames.shape)
+show_frames(frames, waitKey = 100)

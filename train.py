@@ -33,6 +33,8 @@ def train(model, train_loader, val_loader, num_epochs):
         print(f'Train accuracy: {evaluate_model(model, train_loader):.2f}%')
         print(f'Validation accuracy: {evaluate_model(model, val_loader):.2f}%')
         print('--------------------------------------------')
+        
+        
 def evaluate_model(model, dataloader):
     model.eval()
     correct = 0

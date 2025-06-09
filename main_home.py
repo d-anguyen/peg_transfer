@@ -1,4 +1,4 @@
-from load_data import *
+#from load_data import *
 from models import *
 from train import *
 
@@ -13,10 +13,10 @@ import time
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-VIDEO_PATH = '/home/groups/ai/ducanh/PegTransferData/left/'
-CSV_PATH = '/home/groups/ai/ducanh/PegTransferData/PegTransfer.csv'
+VIDEO_PATH = './data/left/'
+CSV_PATH = './data/PegTransfer.csv'
 FRAMES_PER_CLIP = 50
-FRAME_SIZE = (54,96)
+FRAME_SIZE = (56,96)
 batch_size = 20
 lr = 1e-3
 weight_decay = 1e-4
