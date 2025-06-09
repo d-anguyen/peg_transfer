@@ -20,7 +20,7 @@ FRAME_SIZE = (54,96)
 batch_size = 8
 lr = 1e-3
 weight_decay = 1e-4
-num_epochs = 1
+num_epochs = 20
 
 # Create the datasets and dataloaders
 train_dataset = VideoDataset(VIDEO_PATH, CSV_PATH, 'train', resize_shape=FRAME_SIZE, frames_per_clip=FRAMES_PER_CLIP)

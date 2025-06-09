@@ -3,7 +3,6 @@ import torch.nn as nn
 import time 
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-batch_size = 20
 lr = 1e-3
 weight_decay = 1e-4
 
@@ -23,7 +22,7 @@ def train(model, train_loader, val_loader, num_epochs):
             outputs = model(inputs)
             loss = criterion(outputs, labels)
             
-            if i%25 ==0:
+            if i%10 ==0:
                 print(f"Iteration {i}, loss={loss.item():.4f}")
             optimizer.zero_grad()
             loss.backward()
@@ -42,6 +41,7 @@ def evaluate_model(model, dataloader):
     total = 0
     with torch.no_grad():
         for images, labels in dataloader:
+            images, labels = images.to(device), labels.to(device)
             outputs = model(images)
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)
