@@ -3,14 +3,11 @@ import torch.nn as nn
 import time
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-batch_size = 20
-lr = 1e-3
-weight_decay = 1e-4
 
 
 def train(model, train_loader, val_loader, num_epochs):
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
     criterion = nn.CrossEntropyLoss()
 
     for epoch in range(num_epochs):

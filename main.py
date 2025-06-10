@@ -42,4 +42,4 @@ test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
 # Create a SNN model and train
 SNN = ShallowSNNVideoNet(num_classes=2, input_h=FRAME_SIZE[0], input_w=FRAME_SIZE[1]).to(device)
-train(SNN, train_loader, val_loader, num_epochs=num_epochs)
+train(SNN, train_loader, val_loader, num_epochs=num_epochs, lr=lr, weight_decay=weight_decay)
