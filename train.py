@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-
+import time
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 batch_size = 20
@@ -15,6 +15,7 @@ def train(model, train_loader, val_loader, num_epochs):
 
     for epoch in range(num_epochs):
         model.train()
+        start_time = time.time()
         for i, (inputs, labels) in enumerate(train_loader):
             
             inputs = inputs.float().to(device)    # [B, T, C, H, W]
@@ -23,13 +24,13 @@ def train(model, train_loader, val_loader, num_epochs):
             outputs = model(inputs)
             loss = criterion(outputs, labels)
             
-            if i%50 ==0:
+            if i%5 ==0:
                 print(f"Loss={loss.item():.4f}")
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             
-        print(f"Epoch {epoch+1}: Loss = {loss.item():.4f}")
+        print(f"Epoch {epoch+1}: Loss = {loss.item():.4f}, time elapsed = {time.time() - start_time}:.2f")
         print(f'Train accuracy: {evaluate_model(model, train_loader):.2f}%')
         print(f'Validation accuracy: {evaluate_model(model, val_loader):.2f}%')
         print('--------------------------------------------')

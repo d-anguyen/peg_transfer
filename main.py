@@ -14,13 +14,17 @@ import time
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
-#VIDEO_PATH = './data/left/'
-#CSV_PATH = './data/PegTransfer.csv'
-VIDEO_PATH = '/home/groups/ai/ducanh/PegTransferData/left/'
-CSV_PATH = '/home/groups/ai/ducanh/PegTransferData/PegTransfer.csv'
+VIDEO_PATH = './data/left/'
+CSV_PATH = './data/PegTransfer.csv'
+#VIDEO_PATH = '/home/groups/ai/ducanh/PegTransferData/left/'
+#CSV_PATH = '/home/groups/ai/ducanh/PegTransferData/PegTransfer.csv'
+
+#VIDEO_PATH = '../PegTransferData/left/'
+#CSV_PATH = '../PegTransferData/PegTransfer.csv'
 
 FRAMES_PER_CLIP = 50
-FRAME_SIZE = (72,128) #HxW, original = 540x960batch_size = 20
+FRAME_SIZE = (72,128) #HxW, original = 540x960
+batch_size = 8
 
 lr = 1e-3
 weight_decay = 1e-4
@@ -37,5 +41,5 @@ val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
 # Create a SNN model and train
-SNN = ShallowSNNVideoNet().to(device)
+SNN = ShallowSNNVideoNet(num_classes=2, input_h=FRAME_SIZE[0], input_w=FRAME_SIZE[1]).to(device)
 train(SNN, train_loader, val_loader, num_epochs=num_epochs)
