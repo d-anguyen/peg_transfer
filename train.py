@@ -5,9 +5,9 @@ import time
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
-def train(model, train_loader, val_loader, num_epochs):
+def train(model, train_loader, val_loader, num_epochs, lr=1e-3, weight_decay=1e-4):
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     criterion = nn.CrossEntropyLoss()
 
     for epoch in range(num_epochs):
@@ -38,8 +38,11 @@ def evaluate_model(model, dataloader):
     correct = 0
     total = 0
     with torch.no_grad():
-        for images, labels in dataloader:
-            outputs = model(images)
+        for videos,labels in dataloader:
+            videos = videos.to(device)
+            labels = labels.to(device)
+            
+            outputs = model(videos)
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
