@@ -12,11 +12,6 @@ import pandas as pd
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-VIDEO_PATH = './data/left/'
-CSV_PATH = './data/PegTransfer.csv'
-
-
-
 class VideoDataset(Dataset):
     def __init__(self, video_folder, csv_path, data_split, resize_shape=(72,128), frames_per_clip=50):
         self.video_folder = video_folder

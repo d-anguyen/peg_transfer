@@ -27,7 +27,7 @@ def train(model, train_loader, val_loader, num_epochs, lr=1e-3, weight_decay=1e-
             loss.backward()
             optimizer.step()
             
-        print(f"Epoch {epoch+1}: Loss = {loss.item():.4f}, time elapsed = {time.time() - start_time}:.2f")
+        print(f"Epoch {epoch+1}: Loss = {loss.item():.4f}, time elapsed = {(time.time() - start_time):.2f}")
         print(f'Train accuracy: {evaluate_model(model, train_loader):.2f}%')
         print(f'Validation accuracy: {evaluate_model(model, val_loader):.2f}%')
         print('--------------------------------------------')
