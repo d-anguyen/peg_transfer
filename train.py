@@ -22,7 +22,7 @@ def train(model, train_loader, val_loader, num_epochs, lr=1e-3, weight_decay=1e-
             loss = criterion(outputs, labels)
             
             if i%5 ==0:
-                print(f"Loss={loss.item():.4f}")
+                print(f"Iteration {i}, Loss={loss.item():.4f}")
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
