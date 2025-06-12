@@ -20,14 +20,18 @@ class ShallowSNNVideoNet(nn.Module):
         batch, T, C, H, W = x.shape
         mem1 = self.lif1.init_leaky()
         mem2 = self.lif2.init_leaky()
-        spk_sum = 0
+        sum_out = 0 #to_store_sum_of_spike_output_over_time
         for t in range(T):
-            out = self.pool1(self.conv1(x[:, t]))
+            out = self.pool1(self.conv1(x[:, t])) #B x 16 x H/2 x W/2
             spk1, mem1 = self.lif1(out, mem1)
-            out = self.pool2(self.conv2(spk1))
+            
+            out = self.pool2(self.conv2(spk1)) #B x 32 x H/4 x W/4
             spk2, mem2 = self.lif2(out, mem2)
-            spk_sum += spk2
-        out = spk_sum.view(batch, -1)
-        out = self.fc(out)
+            
+            spk_out = self.fc( spk2.view(batch,-1) ) #B x 2
+            sum_out += spk_out 
+            
+        out = sum_out/T # rate-coding
         return out
-
+    
+    
