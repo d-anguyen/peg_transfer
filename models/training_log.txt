@@ -1,0 +1,33 @@
+Network architecture: 
+ShallowSNNVideoNet(
+  (conv1): Conv2d(3, 16, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+  (pool1): MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)
+  (lif1): Leaky()
+  (conv2): Conv2d(16, 32, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+  (pool2): MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)
+  (lif2): Leaky()
+  (fc): Linear(in_features=18432, out_features=2, bias=True)
+)
+Number of epochs: 3 - Learning rate: 0.001 - Weight decay: 0.0001 - StepLR: 1 - GammaLR: 0.5
+##########################################################################
+
+Epoch 1/3 - Current Learning Rate: 0.001
+Train Loss: 0.7260, Train Acc: 0.5144
+Epoch time elapsed: 0.22 hours
+Val Loss: 0.6692, Val Acc: 0.6250
+Checkpoint saved: ./models/checkpoint_epoch1.pth
+Checkpoint saved: ./models/best_model.pth
+Best model updated.
+
+Epoch 2/3 - Current Learning Rate: 0.0005
+Train Loss: 0.6663, Train Acc: 0.6255
+Epoch time elapsed: 0.22 hours
+Val Loss: 0.6703, Val Acc: 0.6250
+Checkpoint saved: ./models/checkpoint_epoch2.pth
+
+Epoch 3/3 - Current Learning Rate: 0.00025
+Train Loss: 0.6615, Train Acc: 0.6255
+Epoch time elapsed: 0.22 hours
+Val Loss: 0.6679, Val Acc: 0.6250
+Checkpoint saved: ./models/checkpoint_epoch3.pth
+Training finished. Total time elapsed: 0.65 hours
