@@ -10,11 +10,13 @@ import pandas as pd
 # Here, frame1 and frame2 should not be in uint8 format to preven subtraction like 0-10 = 246
 # Won't be any problem for us as we normalized each frame already before calling this function
 def frame_diff(frame1, frame2, metric='l2'):
+    
     if metric == 'l2':
         diff = frame1-frame2
         return np.sum(diff**2)
     
     if metric == 'l1':
+        diff = frame1-frame2    
         return np.sum(np.abs(diff))
     
     if metric == "ssim":
@@ -26,13 +28,14 @@ def frame_diff(frame1, frame2, metric='l2'):
 
 
 class VideoDataset(Dataset):
-    def __init__(self, video_folder, csv_path, data_split, resize_shape=(72,128), frames_per_clip=50):
+    def __init__(self, video_folder, csv_path, data_split, resize_shape=(72,128), 
+                 frames_per_clip=50, sampling_method='uniform'):
         self.video_folder = video_folder
         df = pd.read_csv(csv_path)
         self.annotations = df[df['data_split'] == data_split]
         self.resize_shape = resize_shape
         self.frames_per_clip = frames_per_clip
-        
+        self.sampling_method = sampling_method
         
     def __len__(self):
         # Number of samples in the dataset (number of video files)
@@ -46,7 +49,7 @@ class VideoDataset(Dataset):
         label = int(label1 or label2)
         
         # Load the video frames
-        frames = self.load_frames(video_id)
+        frames = self.load_frames(video_id, sampling_method=self.sampling_method)
         
         return frames, label
     
@@ -64,8 +67,7 @@ class VideoDataset(Dataset):
         total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
         print(f"total number of frames: {(total_frames)}")
         
-        
-        frame_indices = self.sample_frame_idxs(video, sampling_method=sampling_method, step=1, metric='l2')
+        frame_indices = self.sample_frame_idxs(video, sampling_method=sampling_method, step=2, metric='l1')
         #frame_indices = np.array([0,1,2,4,5])   
         frames = []
         
@@ -88,15 +90,17 @@ class VideoDataset(Dataset):
         return frames
     
     
-    def sample_frame_idxs(self, video, sampling_method='uniform', step=1, metric='l2'):
+    def sample_frame_idxs(self, video, sampling_method='uniform', step=2, metric='l2'):
         total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
         
         if sampling_method == 'uniform':
+            print(f"Sampling {self.frames_per_clip} frames from {total_frames} frames uniformly...")
             uniform_indices = [i* (total_frames//self.frames_per_clip) for i in range(self.frames_per_clip)]
             #uniform_indices = list(range(0, total_frames, total_frames // (frames_per_clip) ))
             return uniform_indices
         
         elif sampling_method == 'topk':
+            print(f"Sampling top-{self.frames_per_clip} frames based on frame differences with step={step}...")
             if step >= total_frames//self.frames_per_clip:
                 raise RuntimeError('Step to fast!')
             
@@ -176,20 +180,3 @@ class VideoDataset(Dataset):
     
         
     
-#test
-VIDEO_PATH = './data/left/'
-CSV_PATH = './data/PegTransfer.csv'
-FRAMES_PER_CLIP = 30
-FRAME_SIZE = (540,960)#HxW, (72,128)  original = 540x960
-train_dataset = VideoDataset(VIDEO_PATH, CSV_PATH, 'train', resize_shape=FRAME_SIZE, frames_per_clip=FRAMES_PER_CLIP)
-
-save_path = './sampled_' + str(FRAMES_PER_CLIP)+'_frames/'
-os.makedirs(save_path, exist_ok=True)
-train_dataset.show_vid(3, save_to = save_path, sampling_method='uniform')
-
-
-label = train_dataset[3][1]
-if label==1:
-    print('dropped')
-elif label==0:
-    print('not dropped')
