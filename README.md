@@ -22,7 +22,7 @@ _**Note:** When using `pyproject.toml`, `uv sync` will handle all dependencies. 
 Before training, you need to extract frames from the video files. Use the `preprocess_videos.py` script to do so and save them to a directory. The training script expects pre-extracted frames rather than raw video files to avoid video decoding overhead. 
 
 ```bash
-uv run src/preprocess_videos.py \
+uv run preprocess_videos.py \
   --fps 2.0 \ # Frames per second to extract
   --quality 95 \ # JPEG quality
   --output_dir <path-to-output-directory> \
