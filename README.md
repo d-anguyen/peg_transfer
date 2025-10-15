@@ -17,6 +17,17 @@ Training ANN and SNN models for surgical video classification.
 
 _**Note:** When using `pyproject.toml`, `uv sync` will handle all dependencies. If you don't want to use uv, you can put them into a `requirements.txt` file and install them with `pip install -r requirements.txt`._
 
+## Data Preparation
+
+Before training, you need to extract frames from the video files. Use the `preprocess_videos.py` script to do so and save them to a directory. The training script expects pre-extracted frames rather than raw video files to avoid video decoding overhead. 
+
+```bash
+uv run src/preprocess_videos.py \
+  --fps 2.0 \ # Frames per second to extract
+  --quality 95 \ # JPEG quality
+  --output_dir <path-to-output-directory> \
+```
+
 ## Training
 
 All training commands use `uv run src/train.py` with configuration flags.
