@@ -1,172 +1,126 @@
-"""
-Neural network models for video classification.
-"""
-
 import torch
 import torch.nn as nn
-import snntorch as snn
+from einops import rearrange, reduce
+
+from .metaspikeformer import Spiking_vit_MetaFormer
+from .x3d import X3D
+from transformers import AutoModel
 
 
-class VideoANN(nn.Module):
-    """
-    ANN for video classification with temporal averaging.
+class ConsensusPooling(nn.Module):
+    """Pool predictions across multiple clips."""
     
-    Uses standard convolutional layers with ReLU activations.
-    Processes frames independently and averages outputs over time.
-    
-    Architecture:
-    - Two conv blocks (each: Conv2d -> MaxPool -> ReLU)
-    - Fully connected layer for classification
-    - Temporal averaging of frame-level predictions
-    """
-    
-    def __init__(
-        self,
-        num_classes: int = 2,
-        input_h: int = 112,
-        input_w: int = 112,
-    ):
-        """
-        Args:
-            num_classes: Number of output classes
-            input_h: Input frame height
-            input_w: Input frame width
-        """
+    def __init__(self, mode: str = "max"):
         super().__init__()
-        
-        # Fixed architecture with 2 convolutional blocks
-        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, padding=1)
-        self.pool1 = nn.MaxPool2d(2, 2)
-        self.relu1 = nn.ReLU(inplace=True)
-        
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
-        self.pool2 = nn.MaxPool2d(2, 2)
-        self.relu2 = nn.ReLU(inplace=True)
+        self.mode = mode
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.mode == "max":
+            return reduce(x, 'n d -> d', 'max')
+        elif self.mode == "avg":
+            return reduce(x, 'n d -> d', 'mean')
+        else:
+            raise ValueError(f"Unknown pooling mode: {self.mode}")
 
-        # Calculate flattened feature size after pooling
-        # 112 -> 56 -> 28
-        feature_size = 32 * (input_h // 4) * (input_w // 4)
-        
-        # Fully connected output layer
-        self.fc = nn.Linear(feature_size, num_classes)
+
+class SpikeFormerVideoWrapper(nn.Module):
+    """
+    Wrapper for Spiking_vit_MetaFormer.
+    Feeds the entire video clip directly to the model's forward_features().
+    """
+    
+    def __init__(self, model: nn.Module, feature_dim: int):
+        super().__init__()
+        self.model = model
+        self.feature_dim = feature_dim
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass.
-        
         Args:
-            x: Input tensor of shape (B, T, C, H, W)
-               where B=batch size, T=num_frames, C=channels, H=height, W=width
-        
+            x: Single clip (C, T, H, W) or batched clips (N, C, T, H, W)
         Returns:
-            logits: Output logits of shape (B, num_classes)
-                   Computed by averaging frame-level predictions over time
+            Features of shape (feature_dim,) for single input or (N, feature_dim) for batch
         """
-        batch, T, C, H, W = x.shape
-        
-        # Accumulate predictions over time
-        sum_out = 0
-        
-        for t in range(T):
-            out = x[:, t]  # B x C x H x W
-            
-            # Pass through convolutional blocks
-            out = self.relu1(self.pool1(self.conv1(out)))
-            out = self.relu2(self.pool2(self.conv2(out)))
-            
-            # Flatten and classify
-            out = self.fc(out.view(batch, -1))
-            sum_out += out
-        
-        # Average predictions over time
-        out = sum_out / T
-        
-        return out
+        if x.ndim == 4:
+            x_btchw = rearrange(x, 'c t h w -> t 1 c h w')
+        else:
+            # (N, C, T, H, W) -> (T, N, C, H, W)
+            x_btchw = rearrange(x, 'n c t h w -> t n c h w')
+        features = self.model.forward_features(x_btchw)  # (T, B, C, S)
+        features = features.flatten(3).mean(3)  # (T, B, C)
+        features = reduce(features, 't b c -> b c', 'mean')  # (B, C)
+        if x.ndim == 4:
+            return features.squeeze(0)
+        return features  # (N, C)
 
 
-class VideoSNN(nn.Module):
-    """
-    Spiking Neural Network for video classification.
-    
-    Uses snnTorch Leaky Integrate-and-Fire neurons to process video frames
-    with temporal dynamics. Accumulates spike outputs over time using rate coding.
-    
-    Architecture:
-    - Two conv blocks (each: Conv2d -> MaxPool -> LIF neuron)
-    - Fully connected layer for classification
-    - Rate coding: average spike outputs over time
-    """
+class MultiClipClassifier(nn.Module):
+    """Multi-clip video classifier."""
     
     def __init__(
         self,
-        num_classes: int = 2,
-        input_h: int = 112,
-        input_w: int = 112,
-        beta: float = 0.8,
-        learn_beta: bool = True,
-        learn_threshold: bool = True,
+        backbone_type: str = "spikeformer",
+        feature_dim: int = 512,
+        hidden_dim: int = 512,
+        consensus_mode: str = "max",
+        dropout: float = 0.5,
+        **backbone_kwargs
     ):
         """
         Args:
-            num_classes: Number of output classes
-            input_h: Input frame height
-            input_w: Input frame width
-            beta: Decay rate for membrane potential in LIF neurons
-            learn_beta: Whether to learn the beta parameter
-            learn_threshold: Whether to learn the firing threshold
+            backbone_type: 'spikeformer', 'x3d'
+            feature_dim: Backbone output dimension (unused, computed from backbone)
+            hidden_dim: Hidden layer dimension (unused, computed from expansion_factor)
+            consensus_mode: 'max' or 'avg'
+            dropout: Dropout rate
+            backbone_kwargs: Additional arguments for backbone (including expansion_factor)
         """
         super().__init__()
         
-        # Fixed architecture with 2 convolutional blocks
-        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, padding=1)
-        self.pool1 = nn.MaxPool2d(2, 2)
-        self.lif1 = snn.Leaky(beta=beta, learn_beta=learn_beta, learn_threshold=learn_threshold)
-        
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
-        self.pool2 = nn.MaxPool2d(2, 2)
-        self.lif2 = snn.Leaky(beta=beta, learn_beta=learn_beta, learn_threshold=learn_threshold)
-        
-        # Calculate flattened feature size after pooling
-        # 112 -> 56 -> 28
-        feature_size = 32 * (input_h // 4) * (input_w // 4)
-        
-        # Fully connected output layer
-        self.fc = nn.Linear(feature_size, num_classes)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass.
-        
-        Args:
-            x: Input tensor of shape (B, T, C, H, W)
-               where B=batch size, T=num_frames, C=channels, H=height, W=width
-        
-        Returns:
-            logits: Output logits of shape (B, num_classes)
-                   Computed using rate coding (average spike outputs over time)
-        """
-        batch, T, C, H, W = x.shape
-        
-        # Initialize membrane potentials for all LIF neurons
-        mem1 = self.lif1.init_leaky()
-        mem2 = self.lif2.init_leaky()
-        
-        # Accumulate spike outputs over time
-        sum_out = 0
-        
-        for t in range(T):
-            out = x[:, t]  # B x C x H x W
-            # Pass through convolutional blocks with spiking neurons
-            out = self.pool1(self.conv1(out))
-            spk1, mem1 = self.lif1(out, mem1)
+        # Read and remove head-only args from backbone kwargs
+        head_expansion_factor = backbone_kwargs.pop('expansion_factor', 2)
 
-            out = self.pool2(self.conv2(spk1))
-            spk2, mem2 = self.lif2(out, mem2)
-            # Flatten and classify
-            spk_out = self.fc(spk2.view(batch, -1))
-            sum_out += spk_out
-        
-        # Rate coding: average spike outputs over time
-        out = sum_out / T
-        
-        return out
+        # Create backbone
+        if backbone_type == "spikeformer":
+            spikeformer = Spiking_vit_MetaFormer(
+                detach_reset=backbone_kwargs.get('detach_reset', True),
+                img_size_h=backbone_kwargs.get('img_size', 224),
+                img_size_w=backbone_kwargs.get('img_size', 224),
+                in_channels=backbone_kwargs.get('in_channels', 3),
+                num_classes=2,  # Dummy, we'll replace the head
+                depths=backbone_kwargs.get('depths', [2, 2, 2, 2]),
+                embed_dim=backbone_kwargs.get('dims', [64, 128, 256, 512]),
+                num_heads=[d // 32 for d in backbone_kwargs.get('dims', [64, 128, 256, 512])],
+            )
+            feature_dim = backbone_kwargs.get('dims', [64, 128, 256, 512])[-1]
+            self.backbone = SpikeFormerVideoWrapper(spikeformer, feature_dim)
+            
+        elif backbone_type == "x3d":
+            # X3D already handles video input natively
+            self.backbone = X3D(**backbone_kwargs)
+            feature_dim = self.backbone.feature_dim
+        else:
+            raise ValueError(
+                f"Unknown backbone: {backbone_type}. "
+                "Supported: 'spikeformer', 'x3d'"
+            )
+        self.consensus = ConsensusPooling(mode=consensus_mode)
+        expanded_dim = feature_dim * head_expansion_factor
+        self.classifier = nn.Sequential(
+            nn.Linear(feature_dim, expanded_dim, bias=False),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(expanded_dim, 1, bias=True),
+        )
+    
+    def forward(self, clips: torch.Tensor) -> torch.Tensor:
+        features = self.backbone(clips)  # (N, feature_dim)
+        pooled = self.consensus(features)  # (feature_dim,)
+        logit = self.classifier(pooled)  # (1,)
+        return logit
+    
+    def get_clip_predictions(self, clips: torch.Tensor) -> torch.Tensor:
+        feats = self.backbone(clips)  # (N, feature_dim)
+        logits = self.classifier(feats)  # (N, 1)
+        return logits.squeeze(-1)  # (N,)
+

@@ -1,23 +1,74 @@
-"""
-Training script for video classification.
-"""
-
-import argparse
-from pathlib import Path
-import json
-
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.optim import AdamW
-from tqdm import tqdm
+from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR, SequentialLR
+from pathlib import Path
 import numpy as np
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix, roc_auc_score
-import wandb
+from tqdm import tqdm
+import json
+from dataclasses import asdict, is_dataclass
 
-from dataset import PegTransferDataset
-from model import VideoSNN, VideoANN
-from sampling import SamplingConfig
+from .config import Config
+from .dataset import MultiClipDataset, collate_multiclip
+from .model import MultiClipClassifier
+from spikingjelly.clock_driven import functional
+
+
+def set_seed(seed: int):
+    """Set random seeds for reproducibility."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+
+
+def config_to_dict(config: Config) -> dict:
+    """Convert Config dataclass to dict, handling nested dataclasses and Path objects."""
+    def convert_value(value):
+        if isinstance(value, Path):
+            return str(value)
+        elif is_dataclass(value):
+            return asdict(value)
+        elif isinstance(value, (list, tuple)):
+            return [convert_value(v) for v in value]
+        elif isinstance(value, dict):
+            return {k: convert_value(v) for k, v in value.items()}
+        else:
+            return value
+    
+    result = {}
+    for field_name, field_value in config.__dict__.items():
+        result[field_name] = convert_value(field_value)
+    return result
+
+
+def compute_metrics(predictions: list, labels: list) -> dict:
+    """Compute classification metrics."""
+    preds = np.array(predictions)
+    labs = np.array(labels)
+    
+    # Binary classification metrics
+    tp = ((preds == 1) & (labs == 1)).sum()
+    tn = ((preds == 0) & (labs == 0)).sum()
+    fp = ((preds == 1) & (labs == 0)).sum()
+    fn = ((preds == 0) & (labs == 1)).sum()
+    
+    accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0
+    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+    
+    # Matthews Correlation Coefficient
+    denominator = np.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+    mcc = ((tp * tn) - (fp * fn)) / denominator if denominator > 0 else 0
+    mcc_normed = (mcc + 1) / 2  # Scale to [0, 1]
+    
+    return {
+        'accuracy': accuracy,
+        'sensitivity': sensitivity,
+        'specificity': specificity,
+        'balanced_acc': (sensitivity + specificity) / 2,
+        'mcc': mcc,
+        'mcc_normed': mcc_normed,
+    }
 
 
 def train_epoch(
@@ -25,395 +76,393 @@ def train_epoch(
     dataloader: DataLoader,
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
-    device: torch.device,
-    log_wandb: bool = False,
-) -> tuple[float, float]:
+    scheduler: LambdaLR | CosineAnnealingLR | SequentialLR | None,
+    device: str,
+    epoch: int,
+) -> dict:
     """Train for one epoch."""
     model.train()
-    total_loss = 0.0
-    all_preds = []
-    all_labels = []
     
-    pbar = tqdm(dataloader, desc="Training")
-    for batch_idx, batch in enumerate(pbar):
-        frames = batch["frames"].to(device)
-        labels = batch["label"].to(device)
-        
-        optimizer.zero_grad()
+    total_loss = 0
+    predictions = []
+    labels = []
+    logits = []
+    
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]")
+    for batch in pbar:
+        clips = batch['clips'].to(device)  # (num_clips, C, T, H, W)
+        label = batch['label'].to(device)  # (,)
         
         # Forward pass
-        logits = model(frames)
-        loss = criterion(logits, labels)
+        optimizer.zero_grad()
+        logit = model(clips)  # Shape (1,)
+        # Ensure logit and label are both 1D tensors for loss
+        if logit.ndim == 0:
+            logit = logit.unsqueeze(0)
+        loss = criterion(logit, label.float().unsqueeze(0))
         
         # Backward pass
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
         
-        # Track metrics
+        # Reset spiking neurons (if using SpikeFormer)
+        functional.reset_net(model)
+        
+        # Track metrics (threshold at 0.5 for binary classification)
         total_loss += loss.item()
-        preds = logits.argmax(dim=1).cpu().numpy()
-        all_preds.extend(preds)
-        all_labels.extend(labels.cpu().numpy())
+        # logit is (1,), extract scalar for prediction
+        logit_scalar = logit.squeeze().item() if logit.ndim > 0 else logit.item()
+        logits.append(logit_scalar)
+        pred = (logit_scalar > 0.0)
+        predictions.append(pred)
+        labels.append(label.item())
         
-        # Update progress bar
-        pbar.set_postfix({"loss": loss.item()})
-        
-        # Log to wandb (per batch)
-        if log_wandb:
-            wandb.log({
-                "train/batch_loss": loss.item(),
-            })
+        pbar.set_postfix({'loss': loss.item()})
     
-    avg_loss = total_loss / len(dataloader)
-    accuracy = accuracy_score(all_labels, all_preds)
+    metrics = compute_metrics(predictions, labels)
+    metrics['loss'] = total_loss / len(dataloader)
     
-    return avg_loss, accuracy
-
-
-@torch.no_grad()
-def evaluate(
-    model: nn.Module,
-    dataloader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-) -> dict:
-    """Evaluate the model."""
-    model.eval()
-    total_loss = 0.0
-    all_preds = []
-    all_labels = []
-    all_probs = []
-    
-    pbar = tqdm(dataloader, desc="Evaluating")
-    for batch in pbar:
-        frames = batch["frames"].to(device)
-        labels = batch["label"].to(device)
-        
-        # Forward pass
-        logits = model(frames)
-        loss = criterion(logits, labels)
-        
-        # Track metrics
-        total_loss += loss.item()
-        probs = torch.softmax(logits, dim=1)
-        preds = logits.argmax(dim=1).cpu().numpy()
-        all_preds.extend(preds)
-        all_labels.extend(labels.cpu().numpy())
-        all_probs.extend(probs[:, 1].cpu().numpy())  # Probability of positive class
-    
-    avg_loss = total_loss / len(dataloader)
-    accuracy = accuracy_score(all_labels, all_preds)
-    precision, recall, f1, _ = precision_recall_fscore_support(
-        all_labels, all_preds, average="binary", zero_division=0
-    )
-    
-    # Compute confusion matrix
-    cm = confusion_matrix(all_labels, all_preds)
-    
-    # Compute AUC if we have both classes
-    auc = None
-    if len(np.unique(all_labels)) > 1:
-        auc = roc_auc_score(all_labels, all_probs)
-    
-    metrics = {
-        "loss": avg_loss,
-        "accuracy": accuracy,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "auc": auc,
-        "confusion_matrix": cm.tolist(),
-        "all_preds": all_preds,  # Return for wandb plotting
-        "all_labels": all_labels,  # Return for wandb plotting
-    }
+    # Compute logit statistics
+    logits_array = np.array(logits)
+    metrics['logit_mean'] = float(np.mean(logits_array))
+    metrics['logit_std'] = float(np.std(logits_array))
+    metrics['frac_predicted_positive'] = float(np.mean(predictions))
     
     return metrics
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Train video classification model")
-    parser.add_argument("--annotations", type=str, default="/mnt/cluster/datasets/lassdas/annotation/PegTransfer.csv")
-    parser.add_argument("--frames_dir", type=str, default="/mnt/cluster/datasets/lassdas/extracted_frames/PegTransfer/left",
-                        help="Directory containing pre-extracted frames")
-    parser.add_argument("--output_dir", type=str, default="./outputs")
-    parser.add_argument("--num_frames", type=int, default=16, help="Number of frames to sample per video")
-    parser.add_argument("--image_size", type=int, default=224, help="Image size")
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--model_type", type=str, default="ann", 
-                        choices=["snn", "ann"],
-                        help="Model architecture: snn (spiking) or ann (artificial neural network)")
-    parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--seed", type=int, default=42)
-    # Frame sampling parameters
-    parser.add_argument("--sampling_method", type=str, default="uniform", choices=["uniform", "topk"],
-                        help="Frame sampling method")
-    parser.add_argument("--no_random_offset", action="store_true",
-                        help="Disable random offset for uniform sampling (training only, enabled by default)")
-    parser.add_argument("--topk_step", type=int, default=2,
-                        help="Step size for topk sampling (process every Nth frame)")
-    parser.add_argument("--topk_metric", type=str, default="l1", choices=["l1", "l2", "ssim"],
-                        help="Metric for computing frame differences in topk sampling")
-    # Motion caching parameters (for topk sampling)
-    parser.add_argument("--cache_motion", action="store_true",
-                        help="Enable caching of frame differences for topk sampling")
-    parser.add_argument("--motion_cache_dir", type=str, default=None,
-                        help="Directory for frame cache (defaults to <output_dir>/motion_cache)")
-    # Weights & Biases parameters
-    parser.add_argument("--use_wandb", action="store_true",
-                        help="Enable Weights & Biases logging")
-    parser.add_argument("--wandb_project", type=str, default="peg-transfer",
-                        help="Weights & Biases project name")
-    parser.add_argument("--wandb_name", type=str, default=None,
-                        help="Weights & Biases run name (auto-generated if not provided)")
-    parser.add_argument("--wandb_entity", type=str, default=None,
-                        help="Weights & Biases entity (username or team name)")
+@torch.no_grad()
+def eval_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: nn.Module,
+    device: str,
+    epoch: int,
+) -> dict:
+    """Evaluate for one epoch."""
+    model.eval()
     
-    args = parser.parse_args()
+    total_loss = 0
+    predictions = []
+    labels = []
+    logits = []
     
-    # Set seed for reproducibility
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
-    np.random.seed(args.seed)
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Eval]")
+    for batch in pbar:
+        clips = batch['clips'].to(device).float()
+        label = batch['label'].to(device)
+        
+        # Forward pass
+        logit = model(clips).float()  # Shape (1,)
+        # Ensure logit and label are both 1D tensors for loss
+        if logit.ndim == 0:
+            logit = logit.unsqueeze(0)
+        loss = criterion(logit, label.float().unsqueeze(0))
+        
+        # Track metrics (threshold at 0.5 for binary classification)
+        total_loss += loss.item()
+        # logit is (1,), extract scalar for prediction
+        logit_scalar = logit.squeeze().item() if logit.ndim > 0 else logit.item()
+        logits.append(logit_scalar)
+        pred = (logit_scalar > 0.0)
+        predictions.append(pred)
+        labels.append(label.item())
     
-    # Make deterministic 
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    metrics = compute_metrics(predictions, labels)
+    metrics['loss'] = total_loss / len(dataloader)
+    
+    # Compute logit statistics
+    logits_array = np.array(logits)
+    metrics['logit_mean'] = float(np.mean(logits_array))
+    metrics['logit_std'] = float(np.std(logits_array))
+    metrics['frac_predicted_positive'] = float(np.mean(predictions))
+    
+    return metrics
+
+
+def train(config: Config):
+    """Main training function."""
+    
+    # Set seed
+    set_seed(config.seed)
     
     # Create output directory
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    config.train.output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Setup device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    ## Save config (non-mutating, serialize Paths via default=str)
+    #with open(config.train.output_dir / 'config.json', 'w') as f:
+        #json.dump(config_to_dict(config), f, indent=2)
     
-    # Create sampling configuration
-    sampling_config = SamplingConfig(
-        method=args.sampling_method,
-        num_frames=args.num_frames,
-        random_offset=not args.no_random_offset, 
-        topk_step=args.topk_step,
-        topk_metric=args.topk_metric,
-    )
-    
-    # Initialize Weights & Biases
-    if args.use_wandb:
-        # Auto-generate run name if not provided
-        run_name = args.wandb_name or f"{args.model_type}_{args.sampling_method}"
-        
-        # Add offset suffix only for uniform sampling
-        if sampling_config.method == "uniform":
-            if sampling_config.random_offset:
-                run_name += "_offset"
-            else:
-                run_name += "_no_offset"
-        # For top-k, optionally add metric info
-        elif sampling_config.method == "topk":
-            run_name += f"_{sampling_config.topk_metric}"
-        
-        # Prepare config with sampling details for easy filtering
-        config = vars(args).copy()
-        config['random_offset'] = sampling_config.random_offset
-        config['sampling_config'] = sampling_config.to_dict()
-        
-        wandb.init(
-            project=args.wandb_project,
-            name=run_name,
-            entity=args.wandb_entity,
-            config=config,
-            dir=str(output_dir),
-        )
-        print(f"Initialized wandb run: {wandb.run.name}")
-    
-    # Save config
-    config_to_save = vars(args).copy()
-    config_to_save['sampling_config'] = sampling_config.to_dict()
-    with open(output_dir / "config.json", "w") as f:
-        json.dump(config_to_save, f, indent=2)
-    
-    # Setup motion caching for topk sampling
-    motion_cache_dir = None
-    if args.cache_motion and args.sampling_method == "topk":
-        if args.motion_cache_dir is not None:
-            motion_cache_dir = Path(args.motion_cache_dir)
-        else:
-            motion_cache_dir = output_dir / "motion_cache"
-        print(f"Motion caching enabled: {motion_cache_dir}")
+    print("Configuration:")
+    print(f"  Backbone: {config.model.backbone}")
+    print(f"  Epochs: {config.train.epochs}")
+    print(f"  Learning rate: {config.train.lr}")
+    print(f"  Output: {config.train.output_dir}")
+    print()
     
     # Create datasets
-    train_dataset = PegTransferDataset(
-        annotations_path=args.annotations,
-        frames_dir=args.frames_dir,
-        split="train",
-        image_size=(args.image_size, args.image_size),
-        sampling_config=sampling_config,
-        motion_cache_dir=motion_cache_dir,
+    print("Loading datasets...")
+    train_dataset = MultiClipDataset(
+        annotations_path=config.data.annotations_path,
+        frames_dir=config.data.frames_dir,
+        split='train',
+        num_frames=config.data.num_frames,
+        sampling_rate=config.data.sampling_rate,
+        image_size=config.data.image_size,
+        sample_ratio=config.data.train_sample_ratio,
+        augment=True,
+        augment_prob=config.train.augmentation_probability,
+        mean=config.data.mean,
+        std=config.data.std,
     )
     
-    test_dataset = PegTransferDataset(
-        annotations_path=args.annotations,
-        frames_dir=args.frames_dir,
-        split="test",
-        image_size=(args.image_size, args.image_size),
-        sampling_config=sampling_config,
-        motion_cache_dir=motion_cache_dir,
+    val_dataset = MultiClipDataset(
+        annotations_path=config.data.annotations_path,
+        frames_dir=config.data.frames_dir,
+        split='val',
+        num_frames=config.data.num_frames,
+        sampling_rate=config.data.sampling_rate,
+        image_size=config.data.image_size,
+        sample_ratio=config.data.test_sample_ratio,
+        augment=False,
+        mean=config.data.mean,
+        std=config.data.std,
     )
     
-    # Worker init function for deterministic dataloading
-    def worker_init_fn(worker_id):
-        worker_seed = args.seed + worker_id
-        np.random.seed(worker_seed)
-        torch.manual_seed(worker_seed)
+    test_dataset = MultiClipDataset(
+        annotations_path=config.data.annotations_path,
+        frames_dir=config.data.frames_dir,
+        split='test',
+        num_frames=config.data.num_frames,
+        sampling_rate=config.data.sampling_rate,
+        image_size=config.data.image_size,
+        sample_ratio=config.data.test_sample_ratio,
+        augment=False,
+        mean=config.data.mean,
+        std=config.data.std,
+    )
     
-    # Create dataloaders
+    # Create dataloaders (batch_size=1 because each video has multiple clips)
     train_loader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,
+        batch_size=1,
         shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        worker_init_fn=worker_init_fn,
+        num_workers=config.data.num_workers,
+        pin_memory=config.data.pin_memory,
+        collate_fn=collate_multiclip,
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=config.data.num_workers,
+        pin_memory=config.data.pin_memory,
+        collate_fn=collate_multiclip,
     )
     
     test_loader = DataLoader(
         test_dataset,
-        batch_size=args.batch_size,
+        batch_size=1,
         shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        worker_init_fn=worker_init_fn,
+        num_workers=config.data.num_workers,
+        pin_memory=config.data.pin_memory,
+        collate_fn=collate_multiclip,
     )
     
+    print()
+    
     # Create model
-    if args.model_type == "snn":
-        model = VideoSNN(
-            num_classes=2,
-            input_h=args.image_size,
-            input_w=args.image_size,
+    print("Creating model...")
+    if config.model.backbone == "spikeformer":
+        model = MultiClipClassifier(
+            backbone_type="spikeformer",
+            hidden_dim=config.model.hidden_dim,
+            consensus_mode=config.model.consensus_pooling,
+            dropout=config.model.dropout,
+            expansion_factor=config.model.expansion_factor,
+            img_size=config.data.image_size,
+            depths=config.model.spikeformer_depths,
+            dims=config.model.spikeformer_dims,
+            detach_reset=config.model.detach_reset,
         )
-    else:  # ann
-        model = VideoANN(
-            num_classes=2,
-            input_h=args.image_size,
-            input_w=args.image_size,
+    elif config.model.backbone == "x3d":
+        model = MultiClipClassifier(
+            backbone_type="x3d",
+            hidden_dim=config.model.hidden_dim,
+            consensus_mode=config.model.consensus_pooling,
+            dropout=config.model.dropout,
+            expansion_factor=config.model.expansion_factor,
+            model_name=config.model.x3d_model_name,
+            pretrained=config.model.x3d_pretrained,
         )
+    else:
+        raise ValueError(f"Unknown backbone: {config.model.backbone}")
     
-    model = model.to(device)
+    model = model.to(config.device)
+    
+    # Freeze BatchNorm layers if requested (eval mode + freeze affine params)
+    if getattr(config.model, 'frozen_bn', False):
+        for m in model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                m.eval()
+    
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"Model: {args.model_type}")
-    print(f"Total parameters: {total_params:,}")
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Total parameters: {total_params:,}")
+    print(f"  Trainable parameters: {trainable_params:,}")
+    print()
     
-    # Log model to wandb
-    if args.use_wandb:
-        wandb.config.update({"total_parameters": total_params})
-        wandb.watch(model, log="all", log_freq=100)
+    # Create loss function 
+    if config.train.use_pos_weight:
+        pos_weight_val = float(train_dataset.get_pos_weight())
+        pos_weight_tensor = torch.tensor([pos_weight_val], device=config.device, dtype=torch.float32)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+        print(f"Using pos_weight: {pos_weight_val:.2f}")
+    else:
+        criterion = nn.BCEWithLogitsLoss()
     
-    # Loss function with class weights for imbalanced data
-    # Calculate class weights
-    train_labels = train_dataset.data["object_dropped_within_fov"].values
-    pos_weight = (len(train_labels) - train_labels.sum()) / train_labels.sum()
-    class_weights = torch.tensor([1.0, pos_weight], dtype=torch.float32).to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
-    
-    print(f"Class weights: {class_weights.cpu().numpy()}")
-    
-    # Optimizer (constant learning rate)
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # Create optimizer
+    backbone_params = []
+    head_params = []
+
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if name.startswith("classifier") or name.startswith("backbone.head") or "classifier" in name:
+            head_params.append(p)
+        else:
+            backbone_params.append(p)
+
+    optim_groups = [
+        {"params": backbone_params, "lr": config.train.lr},              # e.g., 5e-5
+        {"params": head_params, "lr": max(config.train.lr * 20, 1e-3)},  # e.g., 1e-3
+    ]
+    optimizer = torch.optim.AdamW(
+        optim_groups,
+        weight_decay=config.train.weight_decay,
+    )
+
+    # LR scheduler: cosine with optional warmup (per-iteration)
+    scheduler = None
+    if config.train.use_lr_scheduler:
+        steps_per_epoch = len(train_loader)
+        total_steps = max(1, config.train.epochs * steps_per_epoch)
+        warmup_steps = int(config.train.warmup_ratio * total_steps)
+        base_lr = config.train.lr
+
+        schedulers = []
+        milestones = []
+        if warmup_steps > 0:
+            start_factor = config.train.warmup_start_lr / base_lr if base_lr > 0 else 0.0
+            def lr_lambda(step: int, start_factor=start_factor, warmup_steps=warmup_steps):
+                if step >= warmup_steps:
+                    return 1.0
+                return start_factor + (1.0 - start_factor) * (step / max(1, warmup_steps))
+            warmup = LambdaLR(optimizer, lr_lambda=lr_lambda)
+            schedulers.append(warmup)
+            milestones.append(warmup_steps)
+
+        cosine_steps = max(1, total_steps - warmup_steps)
+        cosine = CosineAnnealingLR(optimizer, T_max=cosine_steps, eta_min=config.train.cosine_end_lr)
+        schedulers.append(cosine)
+        if milestones:
+            scheduler = SequentialLR(optimizer, schedulers=schedulers, milestones=milestones)
+        else:
+            scheduler = cosine
     
     # Training loop
-    best_f1 = 0.0
-    results = []
+    print("\nStarting training...")
+    best_mcc = -1
+    history = {
+        'train': [],
+        'val': [],
+        'test': None,
+    }
     
-    for epoch in range(args.epochs):
-        print(f"\nEpoch {epoch + 1}/{args.epochs}")
-        print("-" * 50)
-        
+    for epoch in range(1, config.train.epochs + 1):
         # Train
-        train_loss, train_acc = train_epoch(
-            model, train_loader, criterion, optimizer, device, log_wandb=args.use_wandb
-        )
-        print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
+        train_metrics = train_epoch(model, train_loader, criterion, optimizer, scheduler, config.device, epoch)
+        history['train'].append(train_metrics)
         
-        # Evaluate
-        test_metrics = evaluate(model, test_loader, criterion, device)
-        print(f"Test Loss: {test_metrics['loss']:.4f}")
-        print(f"Test Acc: {test_metrics['accuracy']:.4f}")
-        print(f"Test Precision: {test_metrics['precision']:.4f}")
-        print(f"Test Recall: {test_metrics['recall']:.4f}")
-        print(f"Test F1: {test_metrics['f1']:.4f}")
-        if test_metrics['auc'] is not None:
-            print(f"Test AUC: {test_metrics['auc']:.4f}")
-        print(f"Confusion Matrix:\n{np.array(test_metrics['confusion_matrix'])}")
+        print(f"Epoch {epoch} [Train] - Loss: {train_metrics['loss']:.4f}, "
+              f"Acc: {train_metrics['accuracy']:.4f}, MCC: {train_metrics['mcc_normed']:.4f}, "
+              f"Logit μ: {train_metrics['logit_mean']:.4f}, Logit σ: {train_metrics['logit_std']:.4f}, "
+              f"Frac Pos: {train_metrics['frac_predicted_positive']:.4f}")
         
-        current_lr = args.lr
-        
-        # Log to wandb
-        if args.use_wandb:
-            log_dict = {
-                "epoch": epoch + 1,
-                "train/loss": train_loss,
-                "train/accuracy": train_acc,
-                "test/loss": test_metrics['loss'],
-                "test/accuracy": test_metrics['accuracy'],
-                "test/precision": test_metrics['precision'],
-                "test/recall": test_metrics['recall'],
-                "test/f1": test_metrics['f1'],
-                "learning_rate": current_lr,
-            }
-            if test_metrics['auc'] is not None:
-                log_dict["test/auc"] = test_metrics['auc']
+        # Validate
+        if epoch % config.train.eval_every == 0:
+            val_metrics = eval_epoch(model, val_loader, criterion, config.device, epoch)
+            history['val'].append(val_metrics)
             
-            # Log confusion matrix using wandb's native support
-            log_dict["test/confusion_matrix"] = wandb.plot.confusion_matrix(
-                preds=test_metrics['all_preds'],
-                y_true=test_metrics['all_labels'],
-                class_names=["No Drop", "Drop"],
-            )
+            print(f"Epoch {epoch} [Val]   - Loss: {val_metrics['loss']:.4f}, "
+                  f"Acc: {val_metrics['accuracy']:.4f}, MCC: {val_metrics['mcc_normed']:.4f}, "
+                  f"Logit μ: {val_metrics['logit_mean']:.4f}, Logit σ: {val_metrics['logit_std']:.4f}, "
+                  f"Frac Pos: {val_metrics['frac_predicted_positive']:.4f}")
             
-            wandb.log(log_dict)
+            # Save best model
+            if config.train.save_best and val_metrics['mcc_normed'] > best_mcc:
+                best_mcc = val_metrics['mcc_normed']
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'val_metrics': val_metrics,
+                }, config.train.output_dir / 'best_model.pt')
+                print(f"  → Saved best model (MCC: {best_mcc:.4f})")
+
+        # Persist history after each epoch
+        with open(config.train.output_dir / 'history.json', 'w') as f:
+            json.dump(history, f, indent=2)
         
-        # Save results
-        results.append({
-            "epoch": epoch + 1,
-            "train_loss": train_loss,
-            "train_acc": train_acc,
-            "test_metrics": test_metrics,
-        })
-        
-        # Save best model
-        if test_metrics['f1'] > best_f1:
-            best_f1 = test_metrics['f1']
-            torch.save({
-                "epoch": epoch + 1,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "test_metrics": test_metrics,
-            }, output_dir / "best_model.pt")
-            print(f"Saved best model with F1: {best_f1:.4f}")
-            
-            # Log best model to wandb
-            if args.use_wandb:
-                wandb.run.summary["best_f1"] = best_f1
-                wandb.run.summary["best_epoch"] = epoch + 1
-        
-        print(f"Learning rate: {current_lr:.6f}")
+        print()
     
-    # Save final results
-    with open(output_dir / "results.json", "w") as f:
-        json.dump(results, f, indent=2, default=str)
+    # Final test evaluation
+    print("Final evaluation on test set...")
+    
+    # Load best model
+    if config.train.save_best:
+        checkpoint = torch.load(
+            config.train.output_dir / 'best_model.pt',
+            weights_only=False,
+            map_location=config.device,
+        )
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"Loaded best model from epoch {checkpoint['epoch']}")
+    
+    test_metrics = eval_epoch(model, test_loader, criterion, config.device, -1)
+    history['test'] = test_metrics
+    
+    print("\nTest Results:")
+    print(f"  Accuracy: {test_metrics['accuracy']:.4f}")
+    print(f"  Sensitivity: {test_metrics['sensitivity']:.4f}")
+    print(f"  Specificity: {test_metrics['specificity']:.4f}")
+    print(f"  Balanced Acc: {test_metrics['balanced_acc']:.4f}")
+    print(f"  MCC: {test_metrics['mcc']:.4f}")
+    print(f"  MCC (normed): {test_metrics['mcc_normed']:.4f}")
+    
+    # Save history (including test)
+    with open(config.train.output_dir / 'history.json', 'w') as f:
+        json.dump(history, f, indent=2)
     
     # Save final model
-    torch.save(model.state_dict(), output_dir / "final_model.pt")
+    torch.save(model.state_dict(), config.train.output_dir / 'final_model.pt')
     
-    if args.use_wandb:
-        wandb.finish()
-    
-    print("\nTraining completed!")
-    print(f"Best F1 score: {best_f1:.4f}")
+    print(f"\nTraining complete! Results saved to {config.train.output_dir}")
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    # Create config
+    config = Config()
+    
+    # You can override config here
+    # config.model.backbone = "spikeformer"
+    # config.train.epochs = 50
+    # config.train.lr = 1e-4
+    
+    # Train
+    train(config)
+

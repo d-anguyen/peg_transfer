@@ -1,279 +1,229 @@
-"""
-Dataset class for PegTransfer video classification.
-
-Works with pre-extracted frames from videos, supporting flexible sampling strategies.
-"""
-
+import numpy as np
 import pandas as pd
+from pathlib import Path
+import cv2
 import torch
 from torch.utils.data import Dataset
-import cv2
-import numpy as np
-from pathlib import Path
-from tqdm import tqdm
-from functools import lru_cache
-
-from sampling import SamplingConfig, FrameSampler
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from einops import rearrange
 
 
-class PegTransferDataset(Dataset):
+class MultiClipDataset(Dataset):
+    """
+    Dataset that loads multiple clips from each video.
+    Each sample returns all clips from a single video.
+    """
     
     def __init__(
         self,
-        annotations_path: str | Path,
-        frames_dir: str | Path,
-        split: str = "train",
-        image_size: tuple[int, int] = (224, 224),
-        sampling_config: SamplingConfig | None = None,
-        motion_cache_dir: str | Path | None = None,
+        annotations_path: Path,
+        frames_dir: Path,
+        split: str,
+        num_frames: int = 16,
+        sampling_rate: int = 5,
+        image_size: int = 224,
+        sample_ratio: float = 0.75,
+        augment: bool = False,
+        augment_prob: float = 1.0,
+        mean: tuple = (0.45, 0.45, 0.45),
+        std: tuple = (0.225, 0.225, 0.225),
     ):
         """
         Args:
-            annotations_path: Path to PegTransfer.csv
-            frames_dir: Path to directory containing extracted frames
+            annotations_path: Path to CSV with columns [id, data_split, object_dropped_within_fov]
+            frames_dir: Directory with frames organized as frames_dir/video_id/frame_000000.jpg
             split: 'train', 'val', or 'test'
-            image_size: Target size for frames (H, W)
-            sampling_config: Sampling configuration (defaults to uniform sampling with 16 frames)
-            motion_cache_dir: Directory to cache frame differences for topk sampling (None disables)
+            num_frames: Number of frames per clip
+            sampling_rate: Sample every Nth frame
+            image_size: Target image size
+            sample_ratio: Fraction of video to cover with clips
+            augment: Whether to apply data augmentation
+            mean: Normalization mean
+            std: Normalization std
         """
-        self.frames_dir = Path(frames_dir)
-        self.image_size = image_size
-        self.split = split
-        
-        # Setup sampling
-        if sampling_config is None:
-            # No config provided - use defaults with auto-enable for training
-            self.sampling_config = SamplingConfig()
-            if split == "train" and self.sampling_config.method == "uniform":
-                self.sampling_config.random_offset = True
-        else:
-            # Config provided - respect the user's settings
-            self.sampling_config = sampling_config
-        
-        self.sampler = FrameSampler(self.sampling_config)
-        
-        # Setup motion cache for topk sampling
-        self.motion_cache_dir = Path(motion_cache_dir) if motion_cache_dir is not None else None
-        if self.motion_cache_dir is not None and self.sampling_config.method == "topk":
-            self.motion_cache_dir.mkdir(parents=True, exist_ok=True)
-            print(f"Motion cache enabled at: {self.motion_cache_dir}")
+        self.frames_dir = frames_dir
+        self.num_frames = num_frames
+        self.sampling_rate = sampling_rate
+        self.sample_ratio = sample_ratio
+        self.augment_prob = augment_prob
         
         # Load annotations
         df = pd.read_csv(annotations_path)
-        self.data = df[df["data_split"] == split].reset_index(drop=True)
+        self.data = df[df['data_split'] == split].reset_index(drop=True)
         
-        print(f"Loaded {len(self.data)} {split} samples")
-        print(f"Frames directory: {self.frames_dir}")
-        print(f"Sampling: {self.sampling_config.method}, {self.sampling_config.num_frames} frames")
-        if self.sampling_config.method == "uniform":
-            print(f"  Random offset: {self.sampling_config.random_offset}")
-        elif self.sampling_config.method == "topk":
-            print(f"  Top-k step: {self.sampling_config.topk_step}, metric: {self.sampling_config.topk_metric}")
-        print(f"Label distribution: {self.data['object_dropped_within_fov'].value_counts().to_dict()}")
+        # Build transforms
+        self.transform = self._build_transform(image_size, augment, mean, std)
         
-        # Cache frame paths for all videos (avoid repeated glob calls)
-        print("Caching frame paths...")
-        self._frame_paths_cache = {}
-        for idx in tqdm(range(len(self.data)), desc="Loading paths"):
-            video_id = self.data.iloc[idx]["id"]
-            self._frame_paths_cache[video_id] = self._load_frame_paths(video_id)
-        
-        # Pre-compute and cache frame differences for topk sampling
-        if self.sampling_config.method == "topk" and self.motion_cache_dir is not None:
-            self._precompute_frame_differences()
+        print(f"Loaded {len(self.data)} videos for {split}")
+        print(f"  Error distribution: {self.data['object_dropped_within_fov'].value_counts().to_dict()}")
+    
+    def _build_transform(self, size: int, augment: bool, mean: tuple, std: tuple):
+        """Build image transforms."""
+        if augment:
+            # Training augmentations with probability knob: augment block applied with p=self.augment_prob,
+            # while resize/crop/normalize/tensor always applied
+            return A.Compose([
+                A.Compose([
+                    A.HorizontalFlip(p=0.5),
+                    A.ColorJitter(
+                        brightness=(0.8, 1.2),
+                        contrast=(0.8, 1.2),
+                        saturation=(0.8, 1.2),
+                        hue=(-0.5, 0.5),
+                        p=0.9,
+                    ),
+                    A.MultiplicativeNoise(multiplier=(0.9, 1.1), per_channel=True, elementwise=True, p=0.75),
+                    A.ShiftScaleRotate(
+                        shift_limit_x=0.1,
+                        shift_limit_y=0.01,
+                        scale_limit=0.1,
+                        rotate_limit=7.5,
+                        border_mode=cv2.BORDER_CONSTANT,
+                        p=0.25,
+                    ),
+                    A.Affine(
+                        scale=0.9,
+                        interpolation=cv2.INTER_CUBIC,
+                        cval=0,
+                        mode=cv2.BORDER_CONSTANT,
+                        keep_ratio=True,
+                        p=0.25,
+                    ),
+                    A.ColorJitter(
+                        brightness=(0.7, 1.2),
+                        contrast=(0.8, 1.2),
+                        saturation=(0.8, 1.2),
+                        hue=(-0.5, 0.5),
+                        p=0.9,
+                    ),
+                    A.MultiplicativeNoise(multiplier=(0.9, 1.1), per_channel=True, elementwise=True, p=0.75),
+                    A.Affine(
+                        scale=(0.95, 1.05),
+                        translate_px={'x': (-15, 15), 'y': (-15, 0)},
+                        rotate=(0, 5),
+                        p=0.8,
+                    ),
+                ], p=float(self.augment_prob)),
+                A.SmallestMaxSize(256, p=1.0),
+                A.CenterCrop(size, size, p=1.0),
+                A.Normalize(mean=mean, std=std, p=1.0),
+                ToTensorV2(),
+            ])
+        else:
+            # Test transforms (no augmentation)
+            return A.Compose([
+                A.Affine(scale=0.9, p=1.0),
+                A.SmallestMaxSize(256, p=1.0),
+                A.CenterCrop(size, size, p=1.0),
+                A.Normalize(mean=mean, std=std, p=1.0),
+                ToTensorV2(),
+            ])
     
     def __len__(self) -> int:
         return len(self.data)
     
-    def _get_video_frame_dir(self, video_id: str) -> Path:
-        """Get the directory containing extracted frames for a video."""
-        return self.frames_dir / video_id
-    
-    @lru_cache(maxsize=1000)
-    def _load_frame_paths(self, video_id: str) -> list[Path]:
+    def __getitem__(self, idx: int) -> dict:
         """
-        Load paths to all extracted frames for a video.
-        
-        Args:
-            video_id: Video identifier
-            
-        Returns:
-            List of frame paths sorted by frame number
-        """
-        frame_dir = self._get_video_frame_dir(video_id)
-        
-        if not frame_dir.exists():
-            raise FileNotFoundError(f"Frame directory not found: {frame_dir}")
-        
-        frame_paths = sorted(frame_dir.glob("frame_*.jpg")) # io op, therefore cached
-        
-        if len(frame_paths) == 0:
-            raise ValueError(f"No frames found in {frame_dir}")
-        
-        return frame_paths
-    
-    def _get_motion_cache_path(self, video_id: str) -> Path:
-        """Get the cache file path for frame differences."""
-        metric = self.sampling_config.topk_metric
-        return self.motion_cache_dir / f"{video_id}_motion_{metric}.npy"
-    
-    def _load_motion_cache(self, video_id: str) -> np.ndarray | None:
-        """Load cached frame differences."""
-        if self.motion_cache_dir is None:
-            return None
-        
-        cache_path = self._get_motion_cache_path(video_id)
-        if cache_path.exists():
-            return np.load(cache_path)
-        return None
-    
-    def _save_motion_cache(self, video_id: str, differences: np.ndarray) -> None:
-        """Save frame differences to cache."""
-        if self.motion_cache_dir is None:
-            return
-        
-        cache_path = self._get_motion_cache_path(video_id)
-        np.save(cache_path, differences)
-    
-    def _compute_frame_differences(self, video_id: str) -> np.ndarray:
-        """
-        Compute frame-to-frame differences for a video.
-        
-        Args:
-            video_id: Video identifier
-            
-        Returns:
-            Array of frame differences
-        """
-        # Try to load from cache first
-        cached_diffs = self._load_motion_cache(video_id)
-        if cached_diffs is not None:
-            return cached_diffs
-        
-        # Load all frames
-        frame_paths = self._load_frame_paths(video_id)
-        
-        # Load and preprocess frames for difference computation
-        frames = []
-        for path in frame_paths:
-            frame = cv2.imread(str(path))
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame = cv2.resize(frame, (self.image_size[1], self.image_size[0]))
-            frame = frame.astype(np.float32) / 255.0
-            frames.append(frame)
-        
-        # Compute differences
-        differences = FrameSampler.compute_frame_differences(
-            frames,
-            metric=self.sampling_config.topk_metric
-        )
-        
-        # Save to cache
-        self._save_motion_cache(video_id, differences)
-        
-        return differences
-    
-    def _precompute_frame_differences(self) -> None:
-        """Pre-compute and cache frame differences for all videos."""
-        print(f"\nPre-computing frame differences for {len(self.data)} videos...")
-        cached_count = 0
-        computed_count = 0
-        
-        for idx in tqdm(range(len(self.data)), desc="Computing motion"):
-            video_id = self.data.iloc[idx]["id"]
-            
-            # Check if already cached
-            if self._load_motion_cache(video_id) is not None:
-                cached_count += 1
-                continue
-            try:
-                self._compute_frame_differences(video_id)
-                computed_count += 1
-            except Exception as e:
-                print(f"\nWarning: Failed to compute differences for {video_id}: {e}")
-        
-        print(f"Motion computation complete: {cached_count} already cached, {computed_count} newly computed")
-        print(f"Cache location: {self.motion_cache_dir}\n")
-    
-    def _load_frames_by_indices(
-        self,
-        frame_paths: list[Path],
-        indices: list[int]
-    ) -> np.ndarray:
-        """
-        Load specific frames by their indices.
-        
-        Args:
-            frame_paths: List of all frame paths
-            indices: Indices of frames to load
-            
-        Returns:
-            Array of frames with shape (num_frames, H, W, 3)
-        """
-        frames = []
-        
-        for idx in indices:
-            # Clamp index to valid range
-            idx = min(idx, len(frame_paths) - 1)
-            
-            # Load frame
-            frame = cv2.imread(str(frame_paths[idx]))
-            if frame is None:
-                # If frame loading fails, use last valid frame or black frame
-                if frames:
-                    frame = frames[-1]
-                else:
-                    frame = np.zeros((self.image_size[0], self.image_size[1], 3), dtype=np.uint8)
-            else:
-                # Convert BGR to RGB and resize
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame = cv2.resize(frame, (self.image_size[1], self.image_size[0]))
-            
-            frames.append(frame)
-        
-        return np.stack(frames)
-    
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        """
-        Get video frames and label.
-        
         Returns:
             Dictionary with:
-                - 'frames': Tensor of shape (num_frames, 3, H, W)
-                - 'label': Binary label (0 or 1)
-                - 'video_id': Video ID string
+                - clips: Tensor of shape (num_clips, C, T, H, W)
+                - label: Binary label (0 or 1)
+                - video_id: Video identifier
         """
         row = self.data.iloc[idx]
-        video_id = row["id"]
+        video_id = row['id']
+        label = int(row['object_dropped_within_fov'])
         
-        # Get cached frame paths (no more repeated glob calls!)
-        frame_paths = self._frame_paths_cache[video_id]
-        total_frames = len(frame_paths)
+        # Get all frame paths for this video
+        video_dir = self.frames_dir / video_id
+        frame_paths = sorted(video_dir.glob('frame_*.jpg'))
         
-        # Sample frame indices
-        if self.sampling_config.method == "uniform":
-            frame_indices = self.sampler.sample_indices(total_frames)
-        elif self.sampling_config.method == "topk":
-            # Load or compute frame differences
-            frame_differences = self._compute_frame_differences(video_id)
-            frame_indices = self.sampler.sample_indices(total_frames, frame_differences)
-        else:
-            raise ValueError(f"Unsupported sampling method: {self.sampling_config.method}")
+        # Sample frame indices for each clip
+        total_frames = len(frame_paths) // self.sampling_rate
+        clip_indices = self._sample_clip_indices(total_frames)
         
-        # Load selected frames
-        frames = self._load_frames_by_indices(frame_paths, frame_indices)
+        # Load clips
+        clips = []
+        for start_idx in clip_indices:
+            clip = self._load_clip(frame_paths, start_idx)
+            clips.append(clip)
         
-        # Normalize to [0, 1]
-        frames = frames.astype(np.float32) / 255.0
-        
-        # Convert to tensor and change to (T, C, H, W)
-        frames = torch.from_numpy(frames).permute(0, 3, 1, 2)
-        
-        # Get label
-        label = int(row["object_dropped_within_fov"])
+        # Stack clips: (num_clips, C, T, H, W)
+        clips = torch.stack(clips, dim=0)
         
         return {
-            "frames": frames,
-            "label": torch.tensor(label, dtype=torch.long),
-            "video_id": video_id,
+            'clips': clips,
+            'label': torch.tensor(label, dtype=torch.long),
+            'video_id': video_id,
         }
+    
+    def _sample_clip_indices(self, total_frames: int) -> list[int]:
+        """Sample start indices for clips to cover sample_ratio of video."""
+        # Calculate number of clips needed
+        num_clips = max(1, int(np.ceil(self.sample_ratio * total_frames / self.num_frames)))
+        
+        # Uniformly sample start indices
+        if num_clips == 1:
+            return [total_frames // 2]  # Middle of video
+        
+        # Evenly spaced clips
+        segment_length = total_frames / num_clips
+        indices = [int(segment_length * i) for i in range(num_clips)]
+        
+        # Ensure indices are valid
+        max_start = max(0, total_frames - self.num_frames)
+        indices = [min(idx, max_start) for idx in indices]
+        
+        return indices
+    
+    def _load_clip(self, frame_paths: list[Path], start_idx: int) -> torch.Tensor:
+        """
+        Load a single clip (sequence of frames).
+        
+        Returns:
+            Tensor of shape (C, T, H, W)
+        """
+        frames = []
+        
+        for i in range(self.num_frames):
+            # Calculate frame index with sampling rate
+            frame_idx = (start_idx + i) * self.sampling_rate
+            frame_idx = min(frame_idx, len(frame_paths) - 1)  # Clamp to valid range
+            
+            # Load and transform frame
+            frame = cv2.imread(str(frame_paths[frame_idx]))
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Apply transforms
+            transformed = self.transform(image=frame)
+            frame_tensor = transformed['image']  # (C, H, W)
+            
+            frames.append(frame_tensor)
+        
+        # Stack into clip: (T, C, H, W) -> (C, T, H, W)
+        clip = torch.stack(frames, dim=0)  # (T, C, H, W)
+        clip = rearrange(clip, 't c h w -> c t h w')
+        
+        return clip
+    
+    def get_pos_weight(self) -> float:
+        """Calculate positive class weight for loss balancing."""
+        labels = self.data['object_dropped_within_fov'].values
+        neg = (labels == 0).sum()
+        pos = (labels == 1).sum()
+        return neg / pos if pos > 0 else 1.0
+
+
+def collate_multiclip(batch: list[dict]) -> dict:
+    """
+    Collate function that handles variable numbers of clips per video.
+    
+    Since each video can have different number of clips, we process videos
+    one at a time during training (batch_size=1 for videos, but each video
+    has multiple clips).
+    """
+    # For simplicity, we just return the first (and only) video in the batch
+    # In practice, batch_size should be 1 for videos
+    assert len(batch) == 1, "Use batch_size=1 for videos (each video has multiple clips)"
+    return batch[0]

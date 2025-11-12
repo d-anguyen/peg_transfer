@@ -1,7 +1,5 @@
 # PegTransfer Video Classification
 
-Training ANN and SNN models for surgical video classification.
-
 ## Setup
 
 1. Clone the repository:
@@ -23,85 +21,47 @@ Before training, you need to extract frames from the video files. Use the `prepr
 
 ```bash
 uv run preprocess_videos.py \
-  --fps 2.0 \ # Frames per second to extract
-  --quality 95 \ # JPEG quality
-  --output_dir <path-to-output-directory> \
+  --video_dir <path-to-video-directory> \
+  --output_dir <path-to-frames-directory>
 ```
 
 ## Training
 
-All training commands use `uv run src/train.py` with configuration flags.
+All training commands use `uv run src/run_train.py` with configuration flags or fall back to the default values in `src/config.py` if not specified.
 
-**Common flags:**
-- `--annotations` - Path to PegTransfer.csv
-- `--frames_dir` - Directory with pre-extracted frames
-- `--output_dir` - Output directory for models/results
-- `--num_frames` - Number of frames to sample (default: 16)
-- `--image_size` - Image size (default: 224)
-- `--batch_size` - Batch size (default: 4)
-- `--epochs` - Training epochs (default: 30)
-- `--seed` - Random seed (default: 42)
-
-**Note:** Remove `--use_wandb` flag to disable Weights & Biases logging.
-
-### ANN with Top-K Sampling
+**X3D**:
 ```bash
-uv run src/train.py \
-  --model_type ann \
-  --sampling_method topk \
-  --topk_step 2 \
-  --topk_metric l1 \
-  --cache_motion \
-  --output_dir outputs/ann_topk \
-  --use_wandb
+uv run -m src/run_train \
+  --backbone x3d \
+  --pooling max \
+  --epochs 100 \
+  --lr 5e-5 \
+  --num_frames 16 \
+  --sampling_rate 5 \
+  --num_workers 8 \
+  --seed 42 \
+  --annotations <annotations-csv> \
+  --frames_dir <frames-directory> \
+  --output_dir <output-directory>
 ```
 
-### SNN with Top-K Sampling
+**MetaSpikeFormer**:
 ```bash
-uv run src/train.py \
-  --model_type snn \
-  --sampling_method topk \
-  --topk_step 2 \
-  --topk_metric l1 \
-  --cache_motion \
-  --output_dir outputs/snn_topk \
-  --use_wandb
+uv run -m src.run_train \
+  --backbone spikeformer \
+  --pooling max \
+  --epochs 100 \
+  --lr 5e-5 \
+  --num_frames 16 \
+  --sampling_rate 5 \
+  --seed 42 \
+  --annotations <annotations-csv> \
+  --frames_dir <frames-directory> \
+  --output_dir <output-directory>
 ```
+- same as X3D, but with `--backbone spikeformer` instead of `--backbone x3d`.
 
-### ANN with Uniform Sampling (No Random Offset)
-```bash
-uv run src/train.py \
-  --model_type ann \
-  --sampling_method uniform \
-  --no_random_offset \
-  --output_dir outputs/ann_no_offset \
-  --use_wandb
-```
+## Note on VRAM requirements
+The current training setup processes one video per batch, fitting as many clips from that video into GPU memory (VRAM) as possible. Each batch contains all possible clips from a single video to achieve the desired video coverage, which requires significant VRAM - currently, training runs on an A100 80GB GPU. Longer clips will require even more memory.
 
-### SNN with Uniform Sampling (No Random Offset)
-```bash
-uv run src/train.py \
-  --model_type snn \
-  --sampling_method uniform \
-  --no_random_offset \
-  --output_dir outputs/snn_no_offset \
-  --use_wandb
-```
-
-### ANN with Uniform Sampling (Random Offset)
-```bash
-uv run src/train.py \
-  --model_type ann \
-  --sampling_method uniform \
-  --output_dir outputs/ann_offset \
-  --use_wandb
-```
-
-### SNN with Uniform Sampling (Random Offset)
-```bash
-uv run src/train.py \
-  --model_type snn \
-  --sampling_method uniform \
-  --output_dir outputs/snn_offset \
-  --use_wandb
-```
+To support training on GPUs with less VRAM, I am now porting Isabel's approach: multi-clip training with gradient accumulation. In this approach, gradients are accumulated over several smaller mini-batches of clips from a single video, which reduces per-batch memory requirements and enables training with smaller GPUs. 
