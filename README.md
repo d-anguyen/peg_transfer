@@ -61,6 +61,14 @@ uv run -m src.run_train \
 ```
 - same as X3D, but with `--backbone spikeformer` instead of `--backbone x3d`.
 
+## Available Checkpoints
+| Checkpoint | Backbone | Pooling | Normalized MCC | Accuracy |
+|------------|----------|----------|----------------|----------|
+| [x3d-peg-transfer-error-detection.pth.tar](checkpoints/x3d-peg-transfer-error-detection.pth.tar) | x3d | max | 0.9836478481397317 | 0.9687494307761135 |
+
+An example for how to load a checkpoint is provided in `load_checkpoint.py`.
+
+
 ## Note on VRAM requirements
 The current training setup processes one video per batch, fitting as many clips from that video into GPU memory (VRAM) as possible. Each batch contains all possible clips from a single video to achieve the desired video coverage, which requires significant VRAM - currently, training runs on an A100 80GB GPU. Longer clips will require even more memory.
 
